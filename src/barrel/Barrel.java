@@ -1,0 +1,478 @@
+package barrel;
+
+import common.Config;
+import common.IndexMessage;
+import common.PageData;
+import common.SearchResult;
+import common.Tokenizer;
+import gateway.GatewayInterface;
+
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.rmi.RemoteException;
+import java.rmi.registry.LocateRegistry;
+import java.rmi.server.UnicastRemoteObject;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+/*
+    Index Storage Barrel: guarda o índice invertido e responde às pesquisas.
+    - Todos os métodos que leem ou alteram o índice são synchronized, porque o RMI
+      executa cada chamada remota numa thread diferente (Downloaders e Gateway em paralelo).
+    - Recebe as páginas dos Downloaders por reliable multicast (deliver), descartando repetidas.
+    - O índice é guardado num ficheiro de objetos (data/<nome>.ser) periodicamente e ao
+      terminar, e é carregado ao arrancar: assim o Barrel recupera o estado depois de um crash.
+    - Sincronização (passo 7): ao arrancar, e sempre que a Gateway indicar que o registo expirou,
+      copia o índice de outro Barrel ativo (getSnapshot) e junta-o ao seu (merge). O que recebeu
+      depois da última gravação, ou o que os Downloaders descartaram enquanto esteve fora da lista,
+      é assim recuperado. Um Barrel novo (sem ficheiro) fica igual aos existentes.
+      A cada heartbeat compara os seus números de sequência com os dos outros Barrels (checkMissing)
+      e volta a sincronizar-se se lhe faltarem mensagens.
+*/
+
+public class Barrel implements BarrelInterface {
+
+    /*
+        Todos os dados do índice, num único objeto para ser gravado/lido de uma só vez.
+    */
+    private static class IndexData implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        // Índice invertido: palavra -> URLs das páginas onde aparece
+        final HashMap<String, HashSet<String>> index = new HashMap<>();
+
+        // URL -> {título, citação} de cada página indexada
+        final HashMap<String, String[]> pages = new HashMap<>();
+
+        // URL -> URLs das páginas que têm ligação para ele (usado na ordenação e nos backlinks)
+        final HashMap<String, HashSet<String>> backlinks = new HashMap<>();
+
+        // Reliable multicast: último número de sequência entregue de cada Downloader (senderId -> seq).
+        // É gravado com o índice para que as mensagens repetidas continuem a ser filtradas depois de reiniciar.
+        HashMap<String, Long> lastSeq = new HashMap<>();
+    }
+
+    private final String name;
+    private final Path dataFile;
+    private IndexData data;
+
+    // true quando há alterações ainda não gravadas em ficheiro (protegido pelo lock do Barrel)
+    private boolean dirty = false;
+
+    // Lock só da gravação em ficheiro (separado do lock do índice; ver save())
+    private final Object saveLock = new Object();
+
+    // Referência remota (stub) deste Barrel, enviada à Gateway no registo
+    private BarrelInterface self;
+
+    public Barrel(String name, Path dataDir) throws IOException {
+        this.name = name;
+        Files.createDirectories(dataDir);
+        this.dataFile = dataDir.resolve(name + ".ser");
+        this.data = load();
+    }
+
+    @Override
+    public synchronized void deliver(IndexMessage message) {
+        // Filtro de duplicados: o Downloader envia por ordem e só avança depois do ACK, por isso
+        // um seq menor ou igual ao último entregue é uma retransmissão já recebida
+        Long last = data.lastSeq.get(message.getSenderId());
+        if (last != null && message.getSeq() <= last) {
+            return;
+        }
+        storePage(message.getPage());
+        data.lastSeq.put(message.getSenderId(), message.getSeq());
+    }
+
+    // Guarda no índice a informação de uma página (idempotente: guardar duas vezes não altera nada).
+    // Público para os testes; remotamente as páginas chegam por deliver().
+    public synchronized void storePage(PageData page) {
+        String url = page.getUrl();
+        data.pages.put(url, new String[]{page.getTitle(), page.getSnippet()});
+
+        // Cada palavra da página aponta para este URL
+        for (String word : page.getWords()) {
+            data.index.computeIfAbsent(word, w -> new HashSet<>()).add(url);
+        }
+
+        // Cada link da página ganha este URL como ligação recebida (ignora links para a própria página)
+        for (String link : page.getLinks()) {
+            if (!link.equals(url)) {
+                data.backlinks.computeIfAbsent(link, l -> new HashSet<>()).add(url);
+            }
+        }
+        dirty = true;
+    }
+
+    @Override
+    public synchronized List<SearchResult> search(String query, int page) {
+        Set<String> terms = Tokenizer.words(query);
+        if (terms.isEmpty() || page < 0) {
+            return new ArrayList<>();
+        }
+
+        // Interseção dos conjuntos de URLs de todos os termos (pesquisa AND)
+        Set<String> matches = null;
+        for (String term : terms) {
+            Set<String> urls = data.index.getOrDefault(term, new HashSet<>());
+            if (matches == null) {
+                matches = new HashSet<>(urls);
+            } else {
+                matches.retainAll(urls);
+            }
+        }
+
+        // Ordena por número de ligações recebidas (desc.); em caso de empate, pelo URL (ordem estável)
+        List<String> sorted = new ArrayList<>(matches);
+        sorted.sort(Comparator.comparingInt(this::inboundCount).reversed().thenComparing(u -> u));
+
+        // Devolve só a página pedida, com PAGE_SIZE resultados
+        List<SearchResult> results = new ArrayList<>();
+        int from = page * PAGE_SIZE;
+        for (int i = from; i < Math.min(from + PAGE_SIZE, sorted.size()); i++) {
+            String url = sorted.get(i);
+            String[] info = data.pages.get(url);
+            results.add(new SearchResult(url, info[0], info[1], inboundCount(url)));
+        }
+        return results;
+    }
+
+    @Override
+    public synchronized List<String> getBacklinks(String url) {
+        List<String> list = new ArrayList<>(data.backlinks.getOrDefault(url, new HashSet<>()));
+        list.sort(null);
+        return list;
+    }
+
+    @Override
+    public synchronized int getWordCount() {
+        return data.index.size();
+    }
+
+    @Override
+    public synchronized int getPageCount() {
+        return data.pages.size();
+    }
+
+    // Cópia do índice serializada DENTRO do lock: o índice não muda a meio da cópia. Se devolvesse o
+    // próprio objeto, o RMI serializava-o depois de o método retornar, já sem o lock.
+    @Override
+    public synchronized byte[] getSnapshot() {
+        return serialize();
+    }
+
+    // Serializa o índice para memória. Só pode ser chamado com o lock do Barrel (o índice não pode
+    // mudar a meio). É usado no snapshot e na gravação em ficheiro.
+    private byte[] serialize() {
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(data);
+        } catch (IOException e) {
+            throw new IllegalStateException("could not serialize index", e); // não acontece em memória
+        }
+        return bytes.toByteArray();
+    }
+
+    // Junta ao índice um snapshot de outro Barrel e devolve o número de páginas novas.
+    // O índice só cresce (conjuntos), por isso juntar é uma UNIÃO: a ordem não importa, repetir não
+    // altera nada, e as mensagens que chegam por multicast durante a sincronização não se perdem.
+    // lastSeq fica com o máximo por Downloader: as mensagens pendentes que já vieram no snapshot são
+    // depois descartadas como repetidas por deliver().
+    public int merge(byte[] snapshot) throws IOException, ClassNotFoundException {
+        // A leitura do snapshot (lenta) é feita fora do lock; só a junção bloqueia as pesquisas
+        IndexData other;
+        try (ObjectInputStream in = new ObjectInputStream(new java.io.ByteArrayInputStream(snapshot))) {
+            other = (IndexData) in.readObject();
+        }
+        synchronized (this) {
+            int before = data.pages.size();
+            other.pages.forEach(data.pages::putIfAbsent);
+            other.index.forEach((word, urls) -> data.index.computeIfAbsent(word, w -> new HashSet<>()).addAll(urls));
+            other.backlinks.forEach((url, from) -> data.backlinks.computeIfAbsent(url, u -> new HashSet<>()).addAll(from));
+            if (other.lastSeq != null) {
+                other.lastSeq.forEach((sender, seq) -> data.lastSeq.merge(sender, seq, Math::max));
+            }
+            dirty = true;
+            return data.pages.size() - before;
+        }
+    }
+
+    // Sincroniza-se com outro Barrel ativo da lista da Gateway (o que tiver mais páginas primeiro;
+    // se falhar, tenta o seguinte) e grava logo o resultado. Devolve false se não houver nenhum.
+    public boolean synchronize(GatewayInterface gateway) throws RemoteException {
+        Map<String, BarrelInterface> others = new HashMap<>(gateway.getBarrels());
+        others.remove(name);
+        Map<String, Integer> sizes = new HashMap<>();
+        for (Map.Entry<String, BarrelInterface> e : others.entrySet()) {
+            try {
+                sizes.put(e.getKey(), e.getValue().getPageCount());
+            } catch (RemoteException ex) {
+                // Barrel em baixo: não serve para a sincronização
+            }
+        }
+        List<String> donors = new ArrayList<>(sizes.keySet());
+        donors.sort(Comparator.comparing((String n) -> sizes.get(n)).reversed().thenComparing(n -> n));
+        for (String donor : donors) {
+            if (syncFrom(donor, others.get(donor))) {
+                return true;
+            }
+        }
+        System.out.println("No other Barrel available to synchronize with: using the local index.");
+        return false;
+    }
+
+    // Copia o snapshot de um Barrel, junta-o ao índice e grava. Devolve false se falhar.
+    private boolean syncFrom(String donor, BarrelInterface stub) {
+        try {
+            int added = merge(stub.getSnapshot());
+            save();
+            System.out.println("Synchronized with Barrel " + donor + ": " + added + " new pages ("
+                    + getPageCount() + " pages, " + getWordCount() + " words).");
+            return true;
+        } catch (IOException | ClassNotFoundException | ClassCastException e) { // IOException inclui RemoteException
+            System.out.println("Could not synchronize with Barrel " + donor + " (" + e.getClass().getSimpleName()
+                    + "), trying the next one.");
+            return false;
+        }
+    }
+
+    @Override
+    public synchronized HashMap<String, Long> getLastSeqs() {
+        return new HashMap<>(data.lastSeq);
+    }
+
+    // Vetores lastSeq dos outros Barrels vistos no heartbeat anterior (só usado pela thread do heartbeat)
+    private Map<String, Map<String, Long>> previousSeqs = new HashMap<>();
+
+    // Deteção de mensagens em falta por números de sequência (anti-entropia), chamada a cada heartbeat.
+    // Cada Downloader numera as mensagens e envia-as todas a todos os Barrels, por ordem: se outro Barrel
+    // já tinha, no heartbeat ANTERIOR, um seq maior do que o deste para algum Downloader, faltam
+    // mensagens a este Barrel (ex.: foram enviadas antes de o Downloader saber que ele existia, ou
+    // descartadas enquanto esteve fora da lista). Nesse caso sincroniza-se com esse Barrel.
+    // Comparar com o heartbeat anterior evita sincronizações por causa de mensagens só a caminho.
+    // Devolve true se se sincronizou.
+    public boolean checkMissing(GatewayInterface gateway) throws RemoteException {
+        Map<String, BarrelInterface> others = new HashMap<>(gateway.getBarrels());
+        others.remove(name);
+        Map<String, Long> mine = getLastSeqs();
+        Map<String, Map<String, Long>> current = new HashMap<>();
+        String ahead = null;
+        for (Map.Entry<String, BarrelInterface> e : others.entrySet()) {
+            try {
+                current.put(e.getKey(), e.getValue().getLastSeqs());
+            } catch (RemoteException ex) {
+                continue; // Barrel em baixo: não serve de comparação
+            }
+            Map<String, Long> before = previousSeqs.get(e.getKey());
+            if (ahead == null && before != null && isBehind(mine, before)) {
+                ahead = e.getKey();
+            }
+        }
+        previousSeqs = current;
+        if (ahead == null) {
+            return false;
+        }
+        System.out.println("Missing messages detected (Barrel " + ahead + " has more messages from a Downloader): "
+                + "synchronizing with it.");
+        return syncFrom(ahead, others.get(ahead));
+    }
+
+    // true se "theirs" tem, para algum Downloader, um seq maior do que "mine"
+    private static boolean isBehind(Map<String, Long> mine, Map<String, Long> theirs) {
+        for (Map.Entry<String, Long> e : theirs.entrySet()) {
+            if (e.getValue() > mine.getOrDefault(e.getKey(), 0L)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Número de páginas com ligação para o URL
+    private int inboundCount(String url) {
+        HashSet<String> links = data.backlinks.get(url);
+        return links == null ? 0 : links.size();
+    }
+
+    // Grava o índice em ficheiro, se houver alterações.
+    // Só a cópia para memória (rápida) é feita com o lock do Barrel; a escrita no disco (lenta) é feita
+    // fora dele, para as pesquisas e as mensagens do multicast não ficarem à espera da gravação.
+    // Escreve primeiro num ficheiro temporário e depois substitui o anterior, para que um crash
+    // a meio da escrita nunca deixe o ficheiro principal corrompido.
+    // saveLock: duas gravações (a periódica e a do fim do programa) nunca escrevem ao mesmo tempo, e
+    // uma cópia mais antiga nunca substitui uma mais recente.
+    public void save() {
+        synchronized (saveLock) {
+            byte[] bytes;
+            synchronized (this) {
+                if (!dirty) {
+                    return;
+                }
+                bytes = serialize();
+                // O que mudar a partir daqui volta a pôr dirty = true e entra na próxima gravação
+                dirty = false;
+            }
+            Path tmp = dataFile.resolveSibling(dataFile.getFileName() + ".tmp");
+            try {
+                Files.write(tmp, bytes);
+                Files.move(tmp, dataFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException e) {
+                System.out.println("Could not save index: " + e.getMessage());
+                synchronized (this) {
+                    dirty = true; // tenta de novo na próxima gravação periódica
+                }
+            }
+        }
+    }
+
+    // Lê o índice do ficheiro; se não existir ou estiver corrompido, começa com um índice vazio
+    private IndexData load() {
+        if (!Files.exists(dataFile)) {
+            System.out.println("No saved index found, starting empty: " + dataFile);
+            return new IndexData();
+        }
+        try (ObjectInputStream in = new ObjectInputStream(Files.newInputStream(dataFile))) {
+            IndexData loaded = (IndexData) in.readObject();
+            // Ficheiros gravados antes do passo 4 não têm lastSeq
+            if (loaded.lastSeq == null) {
+                loaded.lastSeq = new HashMap<>();
+            }
+            System.out.println("Index loaded from " + dataFile + ": " + loaded.pages.size() + " pages, "
+                    + loaded.index.size() + " words");
+            return loaded;
+        } catch (IOException | ClassNotFoundException | ClassCastException e) {
+            System.out.println("Saved index is unreadable, starting empty: " + dataFile + " (" + e + ")");
+            return new IndexData();
+        }
+    }
+
+    // Grava periodicamente (thread daemon, não impede o programa de terminar)
+    public void startAutoSave(long intervalMs) {
+        ScheduledExecutorService saver = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "barrel-saver");
+            t.setDaemon(true);
+            return t;
+        });
+        saver.scheduleAtFixedRate(this::save, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    // Heartbeat: regista-se na Gateway e renova o registo periodicamente. Se a Gateway estiver
+    // desligada ou reiniciar, continua a tentar e volta a aparecer na lista sem ser reiniciado.
+    // Sincronização: no primeiro registo o Barrel ainda não está pronto (não recebe pesquisas, mas
+    // já recebe as mensagens dos Downloaders); copia o índice de outro Barrel e só depois fica pronto.
+    // Se mais tarde a Gateway indicar um registo novo (lease expirada ou Gateway reiniciada), volta a
+    // sincronizar-se, mas continua pronto: o índice está quase completo e, depois de um reinício da
+    // Gateway, os dois Barrels deixariam de responder ao mesmo tempo. Nos restantes heartbeats verifica
+    // se lhe faltam mensagens (checkMissing).
+    private void gatewayHeartbeatLoop(String host, int port, String gatewayName, long intervalMs) {
+        GatewayInterface gateway = null;
+        boolean connected = false; // o último registo foi bem sucedido
+        boolean warned = false;    // já avisou que a Gateway não está disponível (evita repetir a mensagem)
+        boolean synced = false;    // já fez a sincronização do arranque
+        while (true) {
+            try {
+                if (gateway == null) {
+                    gateway = (GatewayInterface) LocateRegistry.getRegistry(host, port).lookup(gatewayName);
+                }
+                // O heartbeat leva o tamanho atual do índice (para as estatísticas da Gateway)
+                boolean newRegistration = gateway.registerBarrel(name, self, getPageCount(), getWordCount(), synced);
+                if (!synced) {
+                    synchronize(gateway);
+                    synced = true;
+                    // Fica pronto já, sem esperar pelo próximo heartbeat
+                    gateway.registerBarrel(name, self, getPageCount(), getWordCount(), true);
+                } else if (newRegistration) {
+                    System.out.println("Registration in Gateway was new (lease expired or Gateway restarted): "
+                            + "synchronizing again.");
+                    synchronize(gateway);
+                } else {
+                    checkMissing(gateway);
+                }
+                if (!connected) {
+                    System.out.println("Registered in Gateway at " + host + ":" + port + ".");
+                    connected = true;
+                    warned = false;
+                }
+            } catch (Exception e) {
+                gateway = null; // na próxima tentativa volta a procurar a Gateway no registry
+                if (!warned) {
+                    System.out.println((connected ? "Lost connection to Gateway" : "Gateway not available at "
+                            + host + ":" + port) + ", retrying every " + intervalMs + " ms.");
+                    warned = true;
+                }
+                connected = false;
+            }
+            try {
+                Thread.sleep(intervalMs);
+            } catch (InterruptedException e) {
+                return;
+            }
+        }
+    }
+
+    // Arranque: java barrel.Barrel <nome> [ficheiro.properties]
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.out.println("Usage: java barrel.Barrel <name> [config.properties]");
+            return;
+        }
+        Path dataDir = null;
+        try {
+            // O nome vem nos argumentos para várias máquinas poderem usar o mesmo ficheiro de configuração
+            String name = args[0];
+            Config config = Config.load(args.length > 1 ? args[1] : Config.DEFAULT_FILE);
+            config.applyLocalHostname();
+
+            // Lê toda a configuração antes de arrancar (um valor inválido termina logo com mensagem clara)
+            dataDir = Paths.get(config.get("barrel.data.dir"));
+            int saveIntervalMs = config.getInt("barrel.save.interval.ms");
+            int heartbeatMs = config.getInt("barrel.heartbeat.ms");
+            String gatewayHost = config.get("gateway.host");
+            int gatewayPort = config.getInt("gateway.port");
+            String gatewayName = config.get("gateway.name");
+
+            // Carrega o índice guardado (recuperação depois de um crash) e ativa a gravação periódica
+            Barrel barrel = new Barrel(name, dataDir);
+            barrel.startAutoSave(saveIntervalMs);
+
+            // Ao terminar normalmente (ex.: Ctrl+C) grava o que ainda faltar
+            Runtime.getRuntime().addShutdownHook(new Thread(barrel::save));
+
+            // Exporta o Barrel como objeto remoto e regista-se na Gateway (com heartbeat periódico)
+            barrel.self = (BarrelInterface) UnicastRemoteObject.exportObject(barrel, 0);
+            new Thread(() -> barrel.gatewayHeartbeatLoop(gatewayHost, gatewayPort, gatewayName, heartbeatMs),
+                    "gateway-heartbeat").start();
+
+            System.out.println("Barrel " + name + " ready: " + barrel.getPageCount() + " pages, "
+                    + barrel.getWordCount() + " words.");
+
+            // Erros previsíveis: mensagem clara em vez de stack trace
+        } catch (NoSuchFileException e) {
+            Config.exitWithError("configuration file not found: " + e.getFile());
+        } catch (IllegalArgumentException e) {
+            Config.exitWithError("invalid configuration: " + e.getMessage());
+        } catch (IOException e) {
+            Config.exitWithError("could not use data directory " + dataDir + ": " + e);
+        } catch (Exception e) {
+            Config.exitWithError("Barrel could not start: " + e);
+        }
+    }
+}
