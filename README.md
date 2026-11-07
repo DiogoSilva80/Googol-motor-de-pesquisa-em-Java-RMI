@@ -1,138 +1,154 @@
-# Googol: motor de pesquisa distribuído (SD 2026/27, Meta 1)
+# Googol: Distributed Search Engine
 
-O Googol é um motor de pesquisa de páginas Web escrito em **Java RMI**. Indexa automaticamente as
-páginas a partir de URLs iniciais e dos que os utilizadores sugerem, e permite pesquisar páginas que
-contêm um conjunto de palavras. Os resultados vêm ordenados pelo número de ligações recebidas e são
-mostrados de 10 em 10.
+> 🇵🇹 [Versão em português](README.pt.md)
 
-O sistema é formado por cinco programas, que podem correr em máquinas diferentes:
+A distributed web search engine written in **Java RMI**, built for the Distributed Systems course (2026/27, Milestone 1) at the University of Coimbra.
 
-| Programa | Classe | Função |
-|---|---|---|
-| Fila de URLs | `queue.URLQueue` | Guarda os URLs por visitar e entrega cada um a um único Downloader |
-| Downloader | `downloader.Downloader` | Descarrega e analisa páginas (jsoup) e envia-as aos Barrels por *reliable multicast*; podem correr vários em paralelo |
-| Storage Barrel | `barrel.Barrel` | Guarda o índice invertido, replicado e persistente; responde às pesquisas |
-| Gateway | `gateway.Gateway` | Única porta de entrada dos clientes: distribui as pesquisas pelos Barrels e envia as estatísticas em tempo real |
-| Cliente | `client.Client` | Menu de consola para indexar URLs, pesquisar, ver ligações e estatísticas |
+Googol automatically crawls and indexes web pages, starting from seed URLs and from URLs submitted by users. Users can search for pages containing a set of words; results are ranked by number of incoming links and shown 10 at a time.
 
-## Requisitos
+## ✨ Highlights
+- **5 independent programs** that can run on different machines
+- **Parallel crawling** with multiple Downloaders (jsoup)
+- **Replicated, persistent inverted index**, kept consistent through **reliable multicast** with retransmission
+- **Fault tolerance:** heartbeats, automatic Barrel removal and re-sync, URLs returned to the queue if a Downloader dies, client retries
+- **Real-time statistics** pushed to clients via RMI callbacks
+- Fully configurable through a properties file (no recompilation needed)
 
-- **JDK 17 ou superior**, com `java` e `javac` no PATH (verificar com `java -version`).
-- A biblioteca **jsoup** já vem incluída em `lib/jsoup-1.23.2.jar`.
+## 🏗️ Architecture
 
-## Estrutura
-
+```mermaid
+flowchart LR
+    C[Client] -->|RMI| G[Gateway]
+    G -->|search| B1[(Barrel 1)]
+    G -->|search| B2[(Barrel 2)]
+    G -->|new URLs| Q[URL Queue]
+    Q -->|next URL| D1[Downloader]
+    Q -->|next URL| D2[Downloader]
+    D1 -->|reliable multicast| B1
+    D1 -->|reliable multicast| B2
+    D2 -->|reliable multicast| B1
+    D2 -->|reliable multicast| B2
+    B1 -.heartbeat.-> G
+    B2 -.heartbeat.-> G
 ```
-googol.properties   configuração (lida ao arrancar; alterar não exige recompilar)
+
+| Program | Class | Role |
+|---|---|---|
+| URL Queue | `queue.URLQueue` | Stores URLs to visit and hands each one to a single Downloader |
+| Downloader | `downloader.Downloader` | Downloads and parses pages (jsoup) and sends them to the Barrels via reliable multicast. Several can run in parallel |
+| Storage Barrel | `barrel.Barrel` | Stores the replicated, persistent inverted index and answers searches |
+| Gateway | `gateway.Gateway` | Single entry point for clients. Distributes searches across Barrels and pushes real-time statistics |
+| Client | `client.Client` | Console menu to index URLs, search, view backlinks and statistics |
+
+## 📋 Requirements
+- **JDK 17+** (`java` and `javac` on the PATH; check with `java -version`)
+- **jsoup** is already bundled at `lib/jsoup-1.23.2.jar`
+
+## 📁 Project structure
+```
+googol.properties   configuration, read at startup
 lib/                jsoup-1.23.2.jar
-src/common/         classes partilhadas (configuração, mensagens, normalização de texto e URLs)
-src/queue/          fila de URLs
-src/downloader/     Downloader e reliable multicast
+src/common/         shared classes (config, messages, text/URL normalization)
+src/queue/          URL Queue
+src/downloader/     Downloader + reliable multicast
 src/barrel/         Storage Barrel
 src/gateway/        Gateway
-src/client/         cliente de consola
+src/client/         Client
 ```
 
-## Compilar
-
-Na pasta do projeto:
-
-**Windows (PowerShell)**
-```powershell
-javac -encoding UTF-8 -d out -cp lib\jsoup-1.23.2.jar (Get-ChildItem src -Recurse -Filter *.java).FullName
-```
+## 🔨 Build
+Run from the project root.
 
 **Linux / macOS**
 ```bash
 javac -encoding UTF-8 -d out -cp lib/jsoup-1.23.2.jar $(find src -name "*.java")
 ```
 
-## Executar (uma máquina)
-
-Com o `googol.properties` incluído, tudo corre na mesma máquina sem alterar nada. Cada programa
-corre num terminal próprio, a partir da pasta do projeto. No Linux/macOS o separador do classpath é
-`:` em vez de `;` (ex.: `-cp "out:lib/jsoup-1.23.2.jar"`).
-
-Ordem recomendada (os programas toleram outra ordem: esperam pelos que ainda não arrancaram):
-
-```
-java -cp "out;lib\jsoup-1.23.2.jar" gateway.Gateway
-java -cp "out;lib\jsoup-1.23.2.jar" barrel.Barrel Barrel1
-java -cp "out;lib\jsoup-1.23.2.jar" barrel.Barrel Barrel2
-java -cp "out;lib\jsoup-1.23.2.jar" queue.URLQueue
-java -cp "out;lib\jsoup-1.23.2.jar" downloader.Downloader
-java -cp "out;lib\jsoup-1.23.2.jar" downloader.Downloader
-java -cp "out;lib\jsoup-1.23.2.jar" client.Client
+**Windows (PowerShell)**
+```powershell
+javac -encoding UTF-8 -d out -cp lib\jsoup-1.23.2.jar (Get-ChildItem src -Recurse -Filter *.java).FullName
 ```
 
-- O **nome do Barrel** é obrigatório e identifica o seu ficheiro de dados. Dois Barrels nunca podem
-  ter o mesmo nome.
-- Pode haver vários Downloaders e vários clientes.
-- Todos os programas aceitam, como último argumento, o caminho de outro ficheiro de configuração
-  (por omissão usam o `googol.properties` da pasta atual).
-- Para terminar um programa: `Ctrl+C`.
+## ▶️ Run on a single machine
+The bundled `googol.properties` works out of the box. Start each program in its own terminal from the project root.
+Recommended order (programs also tolerate other orders and wait for missing ones):
 
-## Executar em duas máquinas
+**Linux / macOS**
+```bash
+java -cp "out:lib/jsoup-1.23.2.jar" gateway.Gateway
+java -cp "out:lib/jsoup-1.23.2.jar" barrel.Barrel Barrel1
+java -cp "out:lib/jsoup-1.23.2.jar" barrel.Barrel Barrel2
+java -cp "out:lib/jsoup-1.23.2.jar" queue.URLQueue
+java -cp "out:lib/jsoup-1.23.2.jar" downloader.Downloader
+java -cp "out:lib/jsoup-1.23.2.jar" downloader.Downloader
+java -cp "out:lib/jsoup-1.23.2.jar" client.Client
+```
+On Windows, use `;` as the classpath separator: `-cp "out;lib\jsoup-1.23.2.jar"`.
 
-Copiar o projeto compilado para as duas máquinas e ajustar o `googol.properties` de cada uma:
+Notes:
+- The **Barrel name is required** and identifies its data file. Two Barrels must never share a name.
+- You can run several Downloaders and several Clients.
+- Every program accepts an optional last argument: the path to another configuration file (default: `googol.properties` in the current folder).
+- Stop any program with `Ctrl+C`.
 
-| | Máquina #1 | Máquina #2 |
+## 🌐 Run on two machines
+Copy the compiled project to both machines and adjust each `googol.properties`:
+
+| Setting | Machine #1 | Machine #2 |
 |---|---|---|
-| Programas | Gateway, URLQueue, Barrel, Downloader | Barrel, Downloader, Client |
-| `rmi.host` (onde está a fila) | IP da #1 | IP da #1 |
-| `gateway.host` (onde está a Gateway) | IP da #1 | IP da #1 |
-| `rmi.hostname.local` (IP **desta** máquina) | IP da #1 | IP da #2 |
+| Programs | Gateway, URLQueue, Barrel, Downloader | Barrel, Downloader, Client |
+| `rmi.host` (where the queue runs) | IP of #1 | IP of #1 |
+| `gateway.host` (where the Gateway runs) | IP of #1 | IP of #1 |
+| `rmi.hostname.local` (IP of **this** machine) | IP of #1 | IP of #2 |
 
-- Os dois Barrels têm de ter nomes diferentes (ex.: `Barrel1` na #1 e `Barrel2` na #2).
-- As máquinas têm de estar na mesma rede, e a firewall tem de permitir o `java`. O RMI usa os portos
-  dos registries (`rmi.port`, `gateway.port`) e portos dinâmicos para os objetos remotos.
+- Give the Barrels different names (e.g. `Barrel1` on #1, `Barrel2` on #2).
+- Both machines must be on the same network and the firewall must allow `java`. RMI uses the registry ports (`rmi.port`, `gateway.port`) plus dynamic ports for remote objects.
 
-## Usar o cliente
+## 💻 Using the client
 
-| Opção | O que faz |
+| Option | Action |
 |---|---|
-| `1` | Indexar um URL (entra no início da fila) |
-| `2` | Pesquisar. Os resultados aparecem de 10 em 10: `s` seguinte, `a` anterior, `l N` páginas com ligação para o resultado N, `m` voltar ao menu |
-| `3` | Páginas com ligação para um URL |
-| `4` | Estatísticas em tempo real (atualizadas só quando mudam); Enter volta ao menu |
-| `0` | Sair |
+| `1` | Index a URL (added to the front of the queue) |
+| `2` | Search. Results shown 10 at a time: `s` next, `a` previous, `l N` pages linking to result N, `m` back to menu |
+| `3` | Show pages that link to a given URL |
+| `4` | Real-time statistics (refreshed only on change). Press Enter to return |
+| `0` | Exit |
 
-## Configuração (`googol.properties`)
+## ⚙️ Configuration (`googol.properties`)
 
-| Chave | Significado |
+| Key | Meaning |
 |---|---|
-| `rmi.host`, `rmi.port` | Máquina e porto do RMI registry da fila de URLs |
-| `rmi.hostname.local` | IP desta máquina, anunciado nas referências remotas (necessário para os callbacks entre máquinas) |
-| `rmi.timeout.ms` | Tempo máximo para ligar a outra máquina e esperar a resposta de uma chamada remota |
-| `queue.name` | Nome da fila no registry |
-| `queue.seeds` | URLs iniciais, separados por vírgulas |
-| `queue.max.retries` | Novas tentativas para um URL cujo download falhou com um erro temporário |
-| `queue.downloader.check.ms` | Intervalo entre verificações (ping) dos Downloaders com um URL em curso; se um morrer, o URL volta à fila |
-| `queue.data.file` | Ficheiro onde a fila guarda os URLs por visitar, os já vistos e as tentativas |
-| `queue.save.interval.ms` | Intervalo entre gravações do estado da fila |
-| `gateway.host`, `gateway.port`, `gateway.name` | Máquina, porto do registry e nome da Gateway |
-| `gateway.barrel.timeout.ms` | Tempo sem heartbeat até a Gateway retirar um Barrel da lista |
-| `gateway.queue.retry.ms` | Intervalo entre tentativas de reenviar à fila os URLs pedidos enquanto ela estava em baixo |
-| `gateway.data.file` | Ficheiro onde a Gateway guarda os URLs pendentes e as contagens de pesquisas |
-| `gateway.save.interval.ms` | Intervalo entre gravações das contagens de pesquisas |
-| `downloader.delay.ms` | Pausa entre páginas de cada Downloader |
-| `downloader.reconnect.ms` | Intervalo entre verificações da fila e da lista de Barrels |
-| `multicast.retry.ms` | Intervalo entre retransmissões a um Barrel que não respondeu |
-| `barrel.data.dir` | Pasta onde os Barrels guardam o índice |
-| `barrel.save.interval.ms` | Intervalo entre gravações do índice |
-| `barrel.heartbeat.ms` | Intervalo entre heartbeats de cada Barrel na Gateway |
-| `client.retry.ms` | Intervalo entre tentativas do cliente quando a Gateway não responde |
-| `client.retry.attempts` | Tentativas de um pedido antes de o cliente desistir e voltar ao menu |
+| `rmi.host`, `rmi.port` | Host and port of the URL Queue's RMI registry |
+| `rmi.hostname.local` | This machine's IP, advertised in remote references (needed for cross-machine callbacks) |
+| `rmi.timeout.ms` | Max time to connect to another machine and wait for a remote call |
+| `queue.name` | Queue name in the registry |
+| `queue.seeds` | Comma-separated seed URLs |
+| `queue.max.retries` | Retries for a URL that failed with a temporary error |
+| `queue.downloader.check.ms` | Ping interval for Downloaders working on a URL; if one dies, the URL goes back to the queue |
+| `queue.data.file` | File where the queue saves pending URLs, seen URLs and retry counts |
+| `queue.save.interval.ms` | Interval between queue state saves |
+| `gateway.host`, `gateway.port`, `gateway.name` | Gateway host, registry port and name |
+| `gateway.barrel.timeout.ms` | Time without a heartbeat before the Gateway drops a Barrel |
+| `gateway.queue.retry.ms` | Interval to resend URLs requested while the queue was down |
+| `gateway.data.file` | File where the Gateway saves pending URLs and search counts |
+| `gateway.save.interval.ms` | Interval between search count saves |
+| `downloader.delay.ms` | Pause between pages for each Downloader |
+| `downloader.reconnect.ms` | Interval to re-check the queue and the Barrel list |
+| `multicast.retry.ms` | Retransmission interval to a Barrel that did not acknowledge |
+| `barrel.data.dir` | Folder where Barrels store their index |
+| `barrel.save.interval.ms` | Interval between index saves |
+| `barrel.heartbeat.ms` | Interval between each Barrel's heartbeat to the Gateway |
+| `client.retry.ms` | Interval between client retries when the Gateway does not respond |
+| `client.retry.attempts` | Attempts per request before the client gives up and returns to the menu |
 
-Erros de configuração (ficheiro inexistente, valor inválido, porto ocupado) aparecem numa linha
-`Error: ...` e o programa termina.
+Configuration errors (missing file, invalid value, port in use) print a single `Error: ...` line and the program exits.
 
-## Apagar os dados de teste
+## 🧹 Resetting test data
+- Each Barrel stores its index in `data/<name>.ser`
+- The Gateway stores its state in `data/gateway-state.ser`
+- The URL Queue stores its state in `data/queue-state.ser`
 
-- Cada Barrel guarda o índice em `data/<nome>.ser`.
-- A Gateway guarda o seu estado em `data/gateway-state.ser`.
-- A fila de URLs guarda o seu estado em `data/queue-state.ser`.
+To start fresh, stop the Gateway, the Queue and **all** Barrels, then delete the `data/` folder on **all** machines. A starting Barrel copies its index from any active Barrel, so if one is still running the old data will come back.
 
-Para começar do zero, parar a Gateway, a fila e todos os Barrels e apagar a pasta `data/` em **todas** as
-máquinas. Um Barrel que arranca copia o índice de outro Barrel ativo, por isso, se algum continuar
-ligado, os dados voltam.
+## 👤 Author
+**Diogo Silva**, Computer Engineering @ University of Coimbra
